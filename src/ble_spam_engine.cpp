@@ -262,7 +262,7 @@ void BleSpamEngine::sendAdvertisement(SpamType type) {
     advParams.adv_int_max = 0x20;
     advParams.adv_type = ADV_TYPE_NONCONN_IND;
     advParams.own_addr_type = BLE_ADDR_TYPE_RANDOM;
-    advParams.channel_map = ADV_CHNL_MAP_ALL;
+    advParams.channel_map = ADV_CHNL_ALL;
     advParams.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
 
     esp_ble_gap_start_advertising(&advParams);
