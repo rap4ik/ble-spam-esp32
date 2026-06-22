@@ -52,11 +52,17 @@ public:
     using TxCallback = std::function<void(SpamType type, const uint8_t* mac, const uint8_t* payload, size_t len)>;
     void setTxCallback(TxCallback cb) { txCallback = cb; }
 
+    // Internal: called by the GAP event handler (not for app use)
+    void onAddrSet();
+    void onAdvDataSet();
+    void onAdvStarted();
+    void onAdvStopped();
+
 private:
     BleSpamEngine() = default;
 
     void randomizeMac();
-    void sendAdvertisement(SpamType type);
+    void beginAdvertiseSequence(SpamType type); // step 1: set random address
 
     // Per-protocol payload builders
     std::vector<uint8_t> buildAppleContinuity(SpamType type);
@@ -72,6 +78,13 @@ private:
     uint32_t intervalMs = 20;
     uint32_t lastSendMs = 0;
     bool rotateMac = true;
+
+    // State machine for one advertise cycle: IDLE -> SETTING_ADDR -> SETTING_DATA -> ADVERTISING -> STOPPING
+    enum class Step { IDLE, SETTING_ADDR, SETTING_DATA, ADVERTISING, STOPPING };
+    Step step = Step::IDLE;
+    std::vector<uint8_t> pendingPayload;
+    SpamType pendingType = SpamType::NONE;
+    uint32_t advStartedAtMs = 0;
 
     SpamStats stats;
     TxCallback txCallback = nullptr;
