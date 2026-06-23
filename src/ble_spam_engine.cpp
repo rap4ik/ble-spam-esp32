@@ -18,18 +18,23 @@ BleSpamEngine& BleSpamEngine::instance() {
 static void gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param) {
     switch (event) {
         case ESP_GAP_BLE_SET_STATIC_RAND_ADDR_EVT:
+            Serial.printf("[GAP] SET_STATIC_RAND_ADDR_EVT status=%d\n", param->set_rand_addr_cmpl.status);
             BleSpamEngine::instance().onAddrSet();
             break;
         case ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT:
+            Serial.printf("[GAP] ADV_DATA_RAW_SET_COMPLETE_EVT status=%d\n", param->adv_data_raw_cmpl.status);
             BleSpamEngine::instance().onAdvDataSet();
             break;
         case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
+            Serial.printf("[GAP] ADV_START_COMPLETE_EVT status=%d\n", param->adv_start_cmpl.status);
             BleSpamEngine::instance().onAdvStarted();
             break;
         case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
+            Serial.printf("[GAP] ADV_STOP_COMPLETE_EVT status=%d\n", param->adv_stop_cmpl.status);
             BleSpamEngine::instance().onAdvStopped();
             break;
         default:
+            Serial.printf("[GAP] other event=%d\n", (int)event);
             break;
     }
 }
@@ -38,15 +43,26 @@ void BleSpamEngine::begin() {
     // Initialize the BT controller in BLE-only mode (saves RAM, faster boot)
     if (!btStarted()) {
         esp_bt_controller_config_t cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-        esp_bt_controller_init(&cfg);
+        esp_err_t err = esp_bt_controller_init(&cfg);
+        Serial.printf("[BLE] controller_init: %d\n", err);
     }
-    esp_bt_controller_enable(ESP_BT_MODE_BLE);
-    esp_bluedroid_init();
-    esp_bluedroid_enable();
-    esp_ble_gap_register_callback(gap_cb);
+    esp_err_t err1 = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+    Serial.printf("[BLE] controller_enable: %d\n", err1);
 
+    esp_err_t err2 = esp_bluedroid_init();
+    Serial.printf("[BLE] bluedroid_init: %d\n", err2);
 
-    randomizeMac();
+    esp_err_t err3 = esp_bluedroid_enable();
+    Serial.printf("[BLE] bluedroid_enable: %d\n", err3);
+
+    esp_err_t err4 = esp_ble_gap_register_callback(gap_cb);
+    Serial.printf("[BLE] gap_register_callback: %d\n", err4);
+
+    // NOTE: do NOT call randomizeMac() here. step is still IDLE at this point
+    // (start() hasn't run yet), so the resulting SET_STATIC_RAND_ADDR_EVT would
+    // race with/“steal” the completion event meant for the first real
+    // beginAdvertiseSequence() call, leaving the state machine stuck forever
+    // with TX=0. The very first randomize now happens inside start()/loop().
 }
 
 // ── Dispatch: build the payload, then kick off the async sequence ──
@@ -87,12 +103,16 @@ void BleSpamEngine::beginAdvertiseSequence(SpamType type) {
     pendingPayload = payload;
     pendingType = type;
 
+    Serial.printf("[BLE] beginAdvertiseSequence type=%d payloadLen=%u rotateMac=%d\n",
+                   (int)type, (unsigned)payload.size(), rotateMac);
+
     if (rotateMac) {
         step = Step::SETTING_ADDR;
         randomizeMac(); // async: completion arrives in onAddrSet()
     } else {
         step = Step::SETTING_DATA;
-        esp_ble_gap_config_adv_data_raw(pendingPayload.data(), pendingPayload.size());
+        esp_err_t err = esp_ble_gap_config_adv_data_raw(pendingPayload.data(), pendingPayload.size());
+        Serial.printf("[BLE] config_adv_data_raw (no rotate) -> %d\n", err);
     }
 }
 
@@ -100,12 +120,15 @@ void BleSpamEngine::beginAdvertiseSequence(SpamType type) {
 // callback (BLE task context) — keep them fast and non-blocking.
 
 void BleSpamEngine::onAddrSet() {
+    Serial.printf("[BLE] onAddrSet step=%d\n", (int)step);
     if (step != Step::SETTING_ADDR) return;
     step = Step::SETTING_DATA;
-    esp_ble_gap_config_adv_data_raw(pendingPayload.data(), pendingPayload.size());
+    esp_err_t err = esp_ble_gap_config_adv_data_raw(pendingPayload.data(), pendingPayload.size());
+    Serial.printf("[BLE] config_adv_data_raw -> %d\n", err);
 }
 
 void BleSpamEngine::onAdvDataSet() {
+    Serial.printf("[BLE] onAdvDataSet step=%d\n", (int)step);
     if (step != Step::SETTING_DATA) return;
     step = Step::ADVERTISING;
 
@@ -117,10 +140,12 @@ void BleSpamEngine::onAdvDataSet() {
     advParams.channel_map = ADV_CHNL_ALL;
     advParams.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
 
-    esp_ble_gap_start_advertising(&advParams);
+    esp_err_t err = esp_ble_gap_start_advertising(&advParams);
+    Serial.printf("[BLE] start_advertising -> %d\n", err);
 }
 
 void BleSpamEngine::onAdvStarted() {
+    Serial.printf("[BLE] onAdvStarted step=%d\n", (int)step);
     if (step != Step::ADVERTISING) return;
 
     advStartedAtMs = millis();
@@ -129,12 +154,18 @@ void BleSpamEngine::onAdvStarted() {
     stats.lastTxTime = millis();
     stats.activeType = pendingType;
 
+    Serial.printf("[BLE] TX #%lu mac=%02X:%02X:%02X:%02X:%02X:%02X\n",
+                   (unsigned long)stats.txCount,
+                   stats.lastMac[0], stats.lastMac[1], stats.lastMac[2],
+                   stats.lastMac[3], stats.lastMac[4], stats.lastMac[5]);
+
     if (txCallback) {
         txCallback(pendingType, stats.lastMac, pendingPayload.data(), pendingPayload.size());
     }
 }
 
 void BleSpamEngine::onAdvStopped() {
+    Serial.printf("[BLE] onAdvStopped, was step=%d\n", (int)step);
     step = Step::IDLE;
 }
 
@@ -146,13 +177,16 @@ void BleSpamEngine::randomizeMac() {
 
     esp_bd_addr_t addr;
     memcpy(addr, mac, 6);
-    esp_ble_gap_set_rand_addr(addr); // completion -> onAddrSet()
+    esp_err_t err = esp_ble_gap_set_rand_addr(addr); // completion -> onAddrSet()
+    Serial.printf("[BLE] set_rand_addr(%02X:%02X:%02X:%02X:%02X:%02X) -> %d\n",
+                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], err);
 
     memcpy(stats.lastMac, mac, 6);
 }
 
 // ── Public control ──────────────────────────────────────────────
 void BleSpamEngine::start(SpamType type) {
+    Serial.printf("[BLE] start(type=%d)\n", (int)type);
     cycleQueue.clear();
     cycleIndex = 0;
 
