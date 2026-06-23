@@ -106,14 +106,13 @@ void BleSpamEngine::beginAdvertiseSequence(SpamType type) {
     Serial.printf("[BLE] beginAdvertiseSequence type=%d payloadLen=%u rotateMac=%d\n",
                    (int)type, (unsigned)payload.size(), rotateMac);
 
-    if (rotateMac) {
-        step = Step::SETTING_ADDR;
-        randomizeMac(); // async: completion arrives in onAddrSet()
-    } else {
-        step = Step::SETTING_DATA;
-        esp_err_t err = esp_ble_gap_config_adv_data_raw(pendingPayload.data(), pendingPayload.size());
-        Serial.printf("[BLE] config_adv_data_raw (no rotate) -> %d\n", err);
-    }
+    // Set adv data FIRST: esp_ble_gap_config_adv_data_raw() works reliably
+    // right after esp_bluedroid_enable(). set_rand_addr() can return
+    // ESP_ERR_INVALID_STATE (259) if called too early/too often back-to-back,
+    // so we only call it once data config is confirmed, right before start.
+    step = Step::SETTING_DATA;
+    esp_err_t err = esp_ble_gap_config_adv_data_raw(pendingPayload.data(), pendingPayload.size());
+    Serial.printf("[BLE] config_adv_data_raw -> %d\n", err);
 }
 
 // onAddrSet/onAdvDataSet/onAdvStarted/onAdvStopped are invoked from the GAP
@@ -122,14 +121,6 @@ void BleSpamEngine::beginAdvertiseSequence(SpamType type) {
 void BleSpamEngine::onAddrSet() {
     Serial.printf("[BLE] onAddrSet step=%d\n", (int)step);
     if (step != Step::SETTING_ADDR) return;
-    step = Step::SETTING_DATA;
-    esp_err_t err = esp_ble_gap_config_adv_data_raw(pendingPayload.data(), pendingPayload.size());
-    Serial.printf("[BLE] config_adv_data_raw -> %d\n", err);
-}
-
-void BleSpamEngine::onAdvDataSet() {
-    Serial.printf("[BLE] onAdvDataSet step=%d\n", (int)step);
-    if (step != Step::SETTING_DATA) return;
     step = Step::ADVERTISING;
 
     esp_ble_adv_params_t advParams = {};
@@ -142,6 +133,28 @@ void BleSpamEngine::onAdvDataSet() {
 
     esp_err_t err = esp_ble_gap_start_advertising(&advParams);
     Serial.printf("[BLE] start_advertising -> %d\n", err);
+}
+
+void BleSpamEngine::onAdvDataSet() {
+    Serial.printf("[BLE] onAdvDataSet step=%d\n", (int)step);
+    if (step != Step::SETTING_DATA) return;
+
+    if (rotateMac) {
+        step = Step::SETTING_ADDR;
+        randomizeMac(); // completion -> onAddrSet() -> start_advertising
+    } else {
+        step = Step::ADVERTISING;
+        esp_ble_adv_params_t advParams = {};
+        advParams.adv_int_min = 0x20;
+        advParams.adv_int_max = 0x20;
+        advParams.adv_type = ADV_TYPE_NONCONN_IND;
+        advParams.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
+        advParams.channel_map = ADV_CHNL_ALL;
+        advParams.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
+
+        esp_err_t err = esp_ble_gap_start_advertising(&advParams);
+        Serial.printf("[BLE] start_advertising (no rotate) -> %d\n", err);
+    }
 }
 
 void BleSpamEngine::onAdvStarted() {
@@ -182,6 +195,27 @@ void BleSpamEngine::randomizeMac() {
                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], err);
 
     memcpy(stats.lastMac, mac, 6);
+
+    if (err != ESP_OK) {
+        // The call was rejected synchronously (e.g. ESP_ERR_INVALID_STATE/259
+        // because the GAP layer briefly couldn't accept it). No SET_STATIC_RAND_ADDR_EVT
+        // will ever arrive for this attempt, so onAddrSet() would never fire and
+        // the whole state machine would hang at TX=0 forever. Recover by just
+        // starting advertising with the public address instead of stalling.
+        Serial.println("[BLE] set_rand_addr failed synchronously, falling back to PUBLIC address for this packet");
+        step = Step::ADVERTISING;
+
+        esp_ble_adv_params_t advParams = {};
+        advParams.adv_int_min = 0x20;
+        advParams.adv_int_max = 0x20;
+        advParams.adv_type = ADV_TYPE_NONCONN_IND;
+        advParams.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
+        advParams.channel_map = ADV_CHNL_ALL;
+        advParams.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
+
+        esp_err_t startErr = esp_ble_gap_start_advertising(&advParams);
+        Serial.printf("[BLE] start_advertising (fallback) -> %d\n", startErr);
+    }
 }
 
 // ── Public control ──────────────────────────────────────────────
