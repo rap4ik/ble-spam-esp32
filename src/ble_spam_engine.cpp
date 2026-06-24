@@ -4,6 +4,7 @@
 #include <esp_gap_ble_api.h>
 #include <esp_bt_device.h>
 #include <esp_random.h>
+#include <nvs_flash.h>
 
 // ── Singleton ──────────────────────────────────────────────────
 BleSpamEngine& BleSpamEngine::instance() {
@@ -40,6 +41,21 @@ static void gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param) 
 }
 
 void BleSpamEngine::begin() {
+    // Bluedroid/BLE stack depends on NVS (bonding table, controller calibration
+    // data etc). Without nvs_flash_init() called first, esp_bt_controller_enable()
+    // and esp_bluedroid_init/enable() fail with ESP_ERR_INVALID_ARG (258) /
+    // ESP_ERR_INVALID_STATE (259) on Arduino-ESP32 — exactly what we saw on the
+    // Serial monitor (controller_enable: 258, bluedroid_*: 259). This was the
+    // actual root cause of TX never working: the whole stack was silently dead
+    // from the very first call, even though our state machine logic was fine.
+    esp_err_t nvsErr = nvs_flash_init();
+    if (nvsErr == ESP_ERR_NVS_NO_FREE_PAGES || nvsErr == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        Serial.printf("[BLE] nvs_flash_init needs erase (err=%d), erasing...\n", nvsErr);
+        nvs_flash_erase();
+        nvsErr = nvs_flash_init();
+    }
+    Serial.printf("[BLE] nvs_flash_init: %d\n", nvsErr);
+
     // Initialize the BT controller in BLE-only mode (saves RAM, faster boot)
     if (!btStarted()) {
         esp_bt_controller_config_t cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
